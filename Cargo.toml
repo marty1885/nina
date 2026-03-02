@@ -1,0 +1,34 @@
+[package]
+name = "nina-rs"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "nina"
+path = "src/main.rs"
+
+[dependencies]
+rig-core = "=0.31.0"
+rusqlite = { version = "=0.38.0", features = ["bundled"] }
+fastembed = "=5.11.0"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "=0.1.89"
+anyhow = "1"
+chrono = { version = "=0.4.40", features = ["serde"] }
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+dotenvy = "=0.15.7"
+tokio-cron-scheduler = "0.13"
+cron = "0.12"
+toml = "0.8"
+mlua = { version = "0.10", features = ["lua54", "vendored", "send"] }
+html2text = "0.14"
+readability-rust = "0.1.0"
+which = "7"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
