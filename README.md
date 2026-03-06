@@ -19,7 +19,7 @@ Nina is just the system's name. Not nessarrily the agent.
 ## Prerequisites
 
 - Rust (2021 edition)
-- [SQLite vec0 extension](https://github.com/asg017/sqlite-vec) installed at `/usr/lib/vec0.so`
+- [SQLite vec0 extension](https://github.com/asg017/sqlite-vec) (set `SQLITE_VEC_PATH` if not in a standard lib directory)
 - A Telegram bot token
 - At least one LLM provider API key
 
@@ -41,8 +41,8 @@ nina
 To configure manually instead, copy the example config and edit it:
 
 ```bash
-mkdir -p ~/.nina
-cp nina.toml.example ~/.nina/nina.toml
+mkdir -p "${NINA_HOME:-$HOME/.nina}"
+cp nina.toml.example "${NINA_HOME:-$HOME/.nina}/nina.toml"
 ```
 
 ### Environment variables
@@ -79,11 +79,11 @@ nina pair reject <code>               # Reject
 
 Shell, web search & fetch, file operations, semantic memory, reminders (one-time & cron), text-to-speech, Lua scripting, cross-session messaging, and timezone-aware time.
 
-Custom skills can be added as markdown files in `~/.nina/skills/` — see the `skills/` directory for examples.
+Custom skills can be added as markdown files in `$NINA_HOME/skills/` — see the `skills/` directory for examples.
 
 ## Data
 
-Everything is stored in a single SQLite database at `~/.nina/data/nina.db` — conversations, memories, reminders, identities.
+Everything is stored in a single SQLite database at `$NINA_HOME/data/nina.db` — conversations, memories, reminders, identities.
 
 ## License
 

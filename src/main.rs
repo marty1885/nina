@@ -271,12 +271,10 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         context_dir.clone(),
     )));
 
-    let tts_client = Arc::new(tts::TtsClient::new(
-        &config.tts_base_url,
-        &config.tts_voice,
-        &config.tts_model,
-    ));
-    skill_registry.register(Box::new(skills::tts::TtsSkill::new(tts_client, router.clone())));
+    if let Some((tts_url, tts_voice, tts_model)) = &config.tts {
+        let tts_client = Arc::new(tts::TtsClient::new(tts_url, tts_voice, tts_model));
+        skill_registry.register(Box::new(skills::tts::TtsSkill::new(tts_client, router.clone())));
+    }
     skill_registry.register(Box::new(skills::sessions_send::SendToSessionSkill::new(router.clone(), sessions_cell.clone())));
 
     skill_registry.register(Box::new(skills::current_time::CurrentTimeSkill::new(pairing_store.clone())));

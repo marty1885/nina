@@ -38,12 +38,14 @@ providers = [
 #   { id = "gemini-flash", weight = 100 },
 # ]
 
-# ── TTS ──────────────────────────────────────────────────────────────────────
+# ── TTS (optional) ───────────────────────────────────────────────────────────
+# Omit this section to disable the speak skill entirely.
+# Can also be configured via TTS_BASE_URL, TTS_VOICE, TTS_MODEL env vars.
 
-[tts]
-base_url = "http://localhost/v1"
-voice    = "alloy"
-model    = "tts-1"
+# [tts]
+# base_url = "http://localhost:8488/v1"
+# voice    = "alloy"
+# model    = "tts-1"
 
 # ── Provider definitions ──────────────────────────────────────────────────────
 # All providers use the OpenAI-compatible chat completions API.

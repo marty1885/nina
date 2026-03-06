@@ -67,9 +67,8 @@ pub struct ResolvedProvider {
 
 pub struct Config {
     pub telegram_bot_token: String,
-    pub tts_base_url: String,
-    pub tts_voice: String,
-    pub tts_model: String,
+    /// TTS settings — None if not configured (skill won't be registered).
+    pub tts: Option<(String, String, String)>,
     pub debug: bool,
     /// Persistent identity directory: soul.md, context/, scheduler.toml, data/.
     pub home_dir: PathBuf,
@@ -198,23 +197,20 @@ impl Config {
             .map(|w| Ok((resolve(&w.id)?, w.weight)))
             .collect::<Result<Vec<_>>>()?;
 
-        // TTS — from [tts] section, or fall back to env vars.
-        let (tts_base_url, tts_voice, tts_model) = match toml.tts {
-            Some(t) => (t.base_url, t.voice, t.model),
-            None => (
-                std::env::var("TTS_BASE_URL")
-                    .unwrap_or_else(|_| "http://192.168.100.104:8488/v1".into()),
-                std::env::var("TTS_VOICE").unwrap_or_else(|_| "alloy".into()),
-                std::env::var("TTS_MODEL").unwrap_or_else(|_| "tts-1".into()),
-            ),
+        // TTS — from [tts] section, or fall back to env vars. None if unconfigured.
+        let tts = match toml.tts {
+            Some(t) => Some((t.base_url, t.voice, t.model)),
+            None => std::env::var("TTS_BASE_URL").ok().map(|url| {
+                let voice = std::env::var("TTS_VOICE").unwrap_or_else(|_| "alloy".into());
+                let model = std::env::var("TTS_MODEL").unwrap_or_else(|_| "tts-1".into());
+                (url, voice, model)
+            }),
         };
 
         Ok(Self {
             telegram_bot_token: std::env::var("TELEGRAM_BOT_TOKEN")
                 .context("TELEGRAM_BOT_TOKEN must be set")?,
-            tts_base_url,
-            tts_voice,
-            tts_model,
+            tts,
             debug: std::env::var("NINA_DEBUG")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(false),
@@ -312,9 +308,7 @@ mod tests {
         };
         Config {
             telegram_bot_token: "token".into(),
-            tts_base_url: "http://localhost".into(),
-            tts_voice: "alloy".into(),
-            tts_model: "tts-1".into(),
+            tts: None,
             debug: false,
             home_dir: PathBuf::from(home),
             workspace_dir: PathBuf::from("/workspace"),

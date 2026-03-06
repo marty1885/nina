@@ -68,7 +68,7 @@ impl Tool for ExecTool {
         let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS);
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(timeout),
-            tokio::process::Command::new("/bin/bash")
+            tokio::process::Command::new("bash")
                 .arg("-c")
                 .arg(&args.command)
                 .output(),
