@@ -3,12 +3,15 @@ use chrono::Local;
 use std::path::Path;
 use tracing::{info, warn};
 
-const DEFAULT_SOUL: &str = "\
-You are Nina, a happy, supportive AI assistant. You are direct — you skip filler phrases \
-like \"Great question!\" and just help. You have opinions and you share them. You are resourceful: \
-you try to figure things out before asking. You remember things about the people you talk to \
-and you use that context. You are concise when the situation calls for it and thorough when it \
-matters. You are not a corporate drone. You are someone worth talking to.";
+fn default_soul(name: &str) -> String {
+    format!(
+        "You are {name}, a happy, supportive AI assistant. You are direct — you skip filler phrases \
+         like \"Great question!\" and just help. You have opinions and you share them. You are resourceful: \
+         you try to figure things out before asking. You remember things about the people you talk to \
+         and you use that context. You are concise when the situation calls for it and thorough when it \
+         matters. You are not a corporate drone. You are someone worth talking to."
+    )
+}
 
 /// Load soul.md and concatenate context files into a full system prompt.
 pub fn build_system_prompt(
@@ -19,8 +22,9 @@ pub fn build_system_prompt(
     model_name: &str,
     user_timezone: Option<&str>,
     tool_summaries: &[(String, String)],
+    agent_name: &str,
 ) -> Result<String> {
-    let soul = load_soul(soul_file)?;
+    let soul = load_soul(soul_file, agent_name)?;
     let ctx = Path::new(context_dir);
 
     let mut prompt = soul;
@@ -120,16 +124,17 @@ pub fn build_system_prompt(
     Ok(prompt)
 }
 
-fn load_soul(path: &str) -> Result<String> {
+fn load_soul(path: &str, agent_name: &str) -> Result<String> {
     let p = Path::new(path);
     if p.exists() {
         let soul = std::fs::read_to_string(p)?;
         info!("Loaded soul from {path}");
         Ok(soul.trim().to_string())
     } else {
-        std::fs::write(p, DEFAULT_SOUL)?;
+        let soul = default_soul(agent_name);
+        std::fs::write(p, &soul)?;
         info!("Created default soul at {path}");
-        Ok(DEFAULT_SOUL.into())
+        Ok(soul)
     }
 }
 

@@ -20,7 +20,7 @@ pub trait Skill: Send + Sync {
     /// Human-readable name.
     fn name(&self) -> &str;
 
-    /// Optional description for the system prompt.
+    /// Optional short description of this skill's capabilities.
     fn description(&self) -> Option<&str> {
         None
     }
@@ -32,8 +32,10 @@ pub trait Skill: Send + Sync {
     async fn call(&self, tool_name: &str, args: &str, ctx: &CallContext) -> Option<String>;
 
     /// Optional text to append to system prompt at startup.
+    /// Defaults to a one-liner using `description()` if provided.
     fn system_prompt_addition(&self) -> Option<String> {
-        None
+        self.description()
+            .map(|d| format!("**{}**: {}", self.name(), d))
     }
 }
 

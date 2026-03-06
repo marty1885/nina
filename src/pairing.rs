@@ -7,13 +7,10 @@ use tracing::info;
 use crate::channel::ChannelTarget;
 
 pub struct PairingRequest {
-    pub id: i64,
     pub code: String,
     pub channel_id: String,
     pub sender_id: String,
-    pub chat_id: i64,
     pub display_name: String,
-    pub created_at: i64,
 }
 
 pub struct ApprovedInfo {
@@ -68,24 +65,23 @@ impl PairingStore {
         // Additive migrations — ignore "duplicate column" errors on re-runs.
         let _ = conn.execute("ALTER TABLE identities ADD COLUMN access_level TEXT", []);
         let _ = conn.execute("ALTER TABLE identities ADD COLUMN relation TEXT", []);
+        let _ = conn.execute("ALTER TABLE identities ADD COLUMN timezone TEXT", []);
+        // Add chat_id to channel_identities so self-awareness can reach users.
+        let _ = conn.execute("ALTER TABLE channel_identities ADD COLUMN chat_id INTEGER", []);
+        // Backfill from pairing_requests for existing rows.
+        let _ = conn.execute(
+            "UPDATE channel_identities ci
+               SET chat_id = (
+                   SELECT pr.chat_id FROM pairing_requests pr
+                   WHERE pr.channel_id = ci.channel_id AND pr.sender_id = ci.sender_id
+                   ORDER BY pr.created_at DESC LIMIT 1
+               )
+             WHERE ci.chat_id IS NULL",
+            [],
+        );
         Ok(Arc::new(Self {
             db: Arc::new(Mutex::new(conn)),
         }))
-    }
-
-    /// Returns the identity_id for a known sender, or None if unpaired.
-    pub fn find_identity(&self, channel_id: &str, sender_id: &str) -> Result<Option<i64>> {
-        let conn = self.db.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT identity_id FROM channel_identities
-             WHERE channel_id = ?1 AND sender_id = ?2",
-        )?;
-        let mut rows = stmt.query(params![channel_id, sender_id])?;
-        if let Some(row) = rows.next()? {
-            Ok(Some(row.get(0)?))
-        } else {
-            Ok(None)
-        }
     }
 
     /// Returns (identity_id, access_level, relation) for a known sender, or None if unpaired.
@@ -192,20 +188,17 @@ impl PairingStore {
     pub fn list_pending(&self) -> Result<Vec<PairingRequest>> {
         let conn = self.db.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, code, channel_id, sender_id, chat_id, display_name, created_at
+            "SELECT code, channel_id, sender_id, display_name
              FROM pairing_requests
              WHERE state = 'pending'
              ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![], |row| {
             Ok(PairingRequest {
-                id: row.get(0)?,
-                code: row.get(1)?,
-                channel_id: row.get(2)?,
-                sender_id: row.get(3)?,
-                chat_id: row.get(4)?,
-                display_name: row.get(5)?,
-                created_at: row.get(6)?,
+                code: row.get(0)?,
+                channel_id: row.get(1)?,
+                sender_id: row.get(2)?,
+                display_name: row.get(3)?,
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
@@ -242,9 +235,9 @@ impl PairingStore {
 
         // Create channel_identity
         conn.execute(
-            "INSERT INTO channel_identities (identity_id, channel_id, sender_id, display_name)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![identity_id, channel_id, sender_id, display_name],
+            "INSERT INTO channel_identities (identity_id, channel_id, sender_id, display_name, chat_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![identity_id, channel_id, sender_id, display_name, chat_id],
         )?;
 
         // Mark request as approved (not yet notified)
@@ -284,6 +277,58 @@ impl PairingStore {
 
         info!(code, "Rejected pairing request");
         Ok(())
+    }
+
+    /// Get the stored IANA timezone for an identity, or None if not set.
+    pub fn get_timezone(&self, identity_id: i64) -> Result<Option<String>> {
+        let conn = self.db.lock().unwrap();
+        let tz: Option<String> = conn
+            .query_row(
+                "SELECT timezone FROM identities WHERE id = ?1",
+                params![identity_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(tz)
+    }
+
+    /// Set the IANA timezone for an identity.
+    pub fn set_timezone(&self, identity_id: i64, timezone: &str) -> Result<()> {
+        let conn = self.db.lock().unwrap();
+        conn.execute(
+            "UPDATE identities SET timezone = ?1 WHERE id = ?2",
+            params![timezone, identity_id],
+        )?;
+        Ok(())
+    }
+
+    /// Returns all identities with their associated (channel_id, chat_id) pairs.
+    /// Used by the self-awareness pass to reach each known user.
+    pub fn get_all_identities_with_channels(&self) -> Result<Vec<(i64, Vec<(String, i64)>)>> {
+        let conn = self.db.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT ci.identity_id, ci.channel_id, ci.chat_id
+             FROM channel_identities ci
+             WHERE ci.chat_id IS NOT NULL
+             ORDER BY ci.identity_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+
+        let mut map: std::collections::HashMap<i64, Vec<(String, i64)>> =
+            std::collections::HashMap::new();
+        for row in rows.flatten() {
+            map.entry(row.0).or_default().push((row.1, row.2));
+        }
+
+        let mut result: Vec<(i64, Vec<(String, i64)>)> = map.into_iter().collect();
+        result.sort_by_key(|(id, _)| *id);
+        Ok(result)
     }
 
     /// If there is an approved-but-unnotified pairing for this sender, mark it notified

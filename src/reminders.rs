@@ -277,7 +277,7 @@ pub fn spawn_reminder_task(
 
         info!(id = reminder.id, msg = %reminder.message, isolated = reminder.isolated, "Firing reminder");
 
-        let call_ctx = CallContext { target: reminder.target.clone() };
+        let call_ctx = CallContext { target: reminder.target.clone(), identity_id: None };
         // Reminders don't participate in branch/merge — use a dummy absorb channel.
         let (_absorb_tx, mut absorb_rx) = tokio::sync::mpsc::channel::<String>(1);
 

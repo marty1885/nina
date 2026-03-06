@@ -62,6 +62,63 @@ impl ConversationStore {
         Ok(())
     }
 
+    /// Atomically persist an assistant(tool_calls) message and all its results
+    /// in a single SQLite transaction.  This prevents the orphaned-tool-result
+    /// corruption that occurs when the process dies between individual inserts.
+    pub fn save_tool_turn(
+        &self,
+        session_key: &str,
+        assistant: &ChatMessage,
+        results: &[ChatMessage],
+    ) -> Result<()> {
+        let assistant_tool_calls_json = assistant
+            .tool_calls
+            .as_ref()
+            .map(|tc| serde_json::to_string(tc))
+            .transpose()
+            .context("Failed to serialize tool_calls")?;
+
+        let now = chrono::Utc::now().timestamp();
+        let conn = self.conn.lock().unwrap();
+
+        let tx = conn.unchecked_transaction()?;
+
+        // Give each message in the turn an explicit +1ms offset so ordering is
+        // unambiguous even if they land within the same millisecond.
+        tx.execute(
+            "INSERT INTO conversations(session_key, role, content, tool_call_id, tool_calls, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                session_key,
+                assistant.role,
+                assistant.content,
+                assistant.tool_call_id,
+                assistant_tool_calls_json,
+                now,
+            ],
+        )
+        .context("Failed to insert assistant tool-call message")?;
+
+        for msg in results {
+            tx.execute(
+                "INSERT INTO conversations(session_key, role, content, tool_call_id, tool_calls, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_key,
+                    msg.role,
+                    msg.content,
+                    msg.tool_call_id,
+                    Option::<String>::None,
+                    now,
+                ],
+            )
+            .context("Failed to insert tool result message")?;
+        }
+
+        tx.commit().context("Failed to commit tool turn transaction")?;
+        Ok(())
+    }
+
     /// Load the last `limit` messages for a session, oldest first.
     pub fn load_history(&self, session_key: &str, limit: usize) -> Result<Vec<ChatMessage>> {
         let conn = self.conn.lock().unwrap();
@@ -69,13 +126,13 @@ impl ConversationStore {
         let mut stmt = conn.prepare(
             "SELECT role, content, tool_call_id, tool_calls
              FROM (
-                 SELECT id, role, content, tool_call_id, tool_calls, created_at
+                 SELECT id, role, content, tool_call_id, tool_calls
                  FROM conversations
                  WHERE session_key = ?1
-                 ORDER BY created_at DESC, id DESC
+                 ORDER BY id DESC
                  LIMIT ?2
              )
-             ORDER BY created_at ASC, id ASC",
+             ORDER BY id ASC",
         )?;
 
         let mut msgs: Vec<ChatMessage> = stmt
@@ -114,6 +171,46 @@ impl ConversationStore {
         }
 
         Ok(msgs)
+    }
+
+    /// Rewrite the full history for a session: delete all rows then re-insert
+    /// the repaired message list.  Called after the sanitizer drops corrupt
+    /// messages so the fix survives restarts.  System messages are skipped.
+    pub fn rewrite_history(&self, session_key: &str, messages: &[ChatMessage]) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let tx = conn.unchecked_transaction()?;
+
+        tx.execute(
+            "DELETE FROM conversations WHERE session_key = ?1",
+            params![session_key],
+        )?;
+
+        let now = chrono::Utc::now().timestamp();
+        for msg in messages {
+            if msg.role == "system" {
+                continue;
+            }
+            let tool_calls_json = msg
+                .tool_calls
+                .as_ref()
+                .map(|tc| serde_json::to_string(tc))
+                .transpose()?;
+            tx.execute(
+                "INSERT INTO conversations(session_key, role, content, tool_call_id, tool_calls, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    session_key,
+                    msg.role,
+                    msg.content,
+                    msg.tool_call_id,
+                    tool_calls_json,
+                    now,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// Delete all messages for a session (called on /reset).

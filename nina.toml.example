@@ -1,0 +1,84 @@
+# Nina configuration file.
+# Copy this to $NINA_HOME/nina.toml (default: ~/.nina/nina.toml) and fill in your providers.
+#
+# Secrets (API keys, tokens) stay in .env or the shell environment.
+# This file controls model routing, TTS, and paths — no secrets here.
+
+# Optional: path to a .env-style secrets file.
+# If set, Nina loads it instead of looking for .env in the working directory.
+# Useful for system-service deployments where you can't pre-load env vars.
+# env_file = "/etc/nina/secrets.env"
+
+# ── Agent LLM routing ────────────────────────────────────────────────────────
+
+[agent]
+# Weighted pool for the main reasoning LLM (primary tier).
+# On each request one provider is sampled by weight (proportional random selection).
+# On infrastructure errors (network failure, 5xx, 429) the next provider in the
+# same tier is tried. Client errors (4xx except 429) are surfaced immediately.
+providers = [
+  { id = "deepseek",     weight = 50 },
+  { id = "gemini-flash", weight = 30 },
+  { id = "sonnet",       weight = 20 },
+]
+# Optional fallback tier — only reached when every provider in `providers` fails
+# with an infrastructure error. Useful for expensive/reliable/local models that
+# you want to use sparingly (e.g. a hosted Sonnet or a local llama).
+# fallback = [
+#   { id = "sonnet", weight = 100 },
+# ]
+
+[gateway]
+# Weighted pool for the gateway layer (branch classification & response merge).
+# Same routing semantics as [agent]. Typically a cheap/fast model.
+providers = [
+  { id = "glm-flash", weight = 100 },
+]
+# fallback = [
+#   { id = "gemini-flash", weight = 100 },
+# ]
+
+# ── TTS ──────────────────────────────────────────────────────────────────────
+
+[tts]
+base_url = "http://localhost/v1"
+voice    = "alloy"
+model    = "tts-1"
+
+# ── Provider definitions ──────────────────────────────────────────────────────
+# All providers use the OpenAI-compatible chat completions API.
+# api_key_env names the environment variable that holds the Bearer token.
+
+[[providers]]
+id          = "deepseek"
+base_url    = "https://api.deepinfra.com/v1/openai"
+model       = "deepseek-ai/DeepSeek-V3.2"
+api_key_env = "DEEPINFRA_API_KEY"
+
+[[providers]]
+id          = "glm-flash"
+base_url    = "https://api.deepinfra.com/v1/openai"
+model       = "zai-org/GLM-4.7-Flash"
+api_key_env = "DEEPINFRA_API_KEY"
+
+[[providers]]
+id          = "gemini-flash"
+base_url    = "https://generativelanguage.googleapis.com/v1beta/openai"
+model       = "gemini-2.0-flash"
+api_key_env = "GOOGLE_AI_API_KEY"
+
+[[providers]]
+id          = "sonnet"
+base_url    = "https://api.anthropic.com/v1"
+model       = "claude-sonnet-4-6"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# ── Vertex AI / other OpenAI-compat endpoints ────────────────────────────────
+# Any OpenAI-compatible endpoint works. For Vertex AI, set base_url to your
+# regional OpenAI-compat endpoint and put the Bearer token in the named env var.
+#
+# [[providers]]
+# id          = "vertex-gemini"
+# base_url    = "https://REGION-aiplatform.googleapis.com/v1beta1/projects/PROJECT/locations/REGION/endpoints/openapi"
+# model       = "google/gemini-2.0-flash-001"
+# api_key_env = "VERTEX_API_KEY"

@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::future::Future;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const MAX_ITERATIONS: usize = 15;
 const MAX_MESSAGES: usize = 80;
@@ -66,7 +66,7 @@ impl Agent {
         Fut: Future<Output = ()> + Send,
     {
         // --- RAG: recall relevant memories and prepend to in-session user message ---
-        let memories = self.memory.recall(user_text).await.unwrap_or_else(|_| String::new());
+        let memories = self.memory.recall(user_text, ctx.identity_id).await.unwrap_or_else(|_| String::new());
 
         let no_memories = memories.is_empty() || memories == "No memories found.";
 
@@ -122,7 +122,10 @@ impl Agent {
                 }
             }
 
-            let messages = self.sessions.get_messages(session_key).await;
+            let (messages, repaired) = sanitize_messages(self.sessions.get_messages(session_key).await);
+            if repaired {
+                self.sessions.repair_messages(session_key, messages.clone()).await;
+            }
             let response = self.llm.complete(&messages, &tool_defs).await?;
 
             match response {
@@ -221,23 +224,13 @@ impl Agent {
                         on_interim_text(text.clone()).await;
                     }
 
-                    // Push the assistant message with tool calls (+ any content)
-                    self.sessions
-                        .push_message(
-                            session_key,
-                            ChatMessage {
-                                role: "assistant".into(),
-                                content: content,
-                                tool_calls: Some(tool_calls.clone()),
-                                tool_call_id: None,
-                            },
-                        )
-                        .await;
-
-                    // Execute all tool calls concurrently
+                    // Execute tools BEFORE writing to the session so we can push
+                    // assistant + results in one atomic operation.  This prevents
+                    // a concurrent branch from interleaving a user message between
+                    // the assistant(tool_calls) and its results, which would produce
+                    // "tool message has no corresponding toolcall" API errors.
                     let results = execute_tools_parallel(&self.tools, &tool_calls, ctx).await;
 
-                    // Push all tool results
                     let tool_messages: Vec<ChatMessage> = tool_calls
                         .iter()
                         .zip(results.iter())
@@ -258,8 +251,18 @@ impl Agent {
                         })
                         .collect();
 
+                    // Atomic: assistant(tool_calls) + all results land together.
                     self.sessions
-                        .push_messages(session_key, tool_messages)
+                        .push_tool_turn(
+                            session_key,
+                            ChatMessage {
+                                role: "assistant".into(),
+                                content,
+                                tool_calls: Some(tool_calls.clone()),
+                                tool_call_id: None,
+                            },
+                            tool_messages,
+                        )
                         .await;
 
                     // Burst guard: track iterations where every tool call failed.
@@ -311,6 +314,151 @@ fn truncate_debug(s: &str, max: usize) -> &str {
         Some((idx, _)) => &s[..idx],
         None => s,
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_debug_short_string() {
+        assert_eq!(truncate_debug("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_debug_exact_length() {
+        assert_eq!(truncate_debug("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_debug_long_string() {
+        assert_eq!(truncate_debug("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_debug_empty() {
+        assert_eq!(truncate_debug("", 10), "");
+    }
+
+    #[test]
+    fn truncate_debug_unicode_boundary() {
+        // "日本語" — 3 chars, each 3 bytes; truncate at char 2 should not panic
+        let s = "日本語test";
+        let result = truncate_debug(s, 2);
+        assert_eq!(result, "日本");
+    }
+
+    #[test]
+    fn is_tool_error_tool_error_prefix() {
+        assert!(is_tool_error("Tool error: something failed"));
+    }
+
+    #[test]
+    fn is_tool_error_invalid_arguments() {
+        assert!(is_tool_error("Invalid arguments: bad json"));
+    }
+
+    #[test]
+    fn is_tool_error_unknown_tool() {
+        assert!(is_tool_error("Unknown tool: foo"));
+    }
+
+    #[test]
+    fn is_tool_error_false_for_success() {
+        assert!(!is_tool_error("OK"));
+        assert!(!is_tool_error("some result"));
+        assert!(!is_tool_error(""));
+    }
+
+    #[test]
+    fn is_tool_error_false_for_partial_prefix() {
+        assert!(!is_tool_error("tool error: lowercase prefix"));
+    }
+}
+
+/// Repair a message list that may have gotten out of sync (crash or concurrent-branch race).
+///
+/// Invariant enforced: every `tool` result must have its owning `assistant(tool_calls)`
+/// as its nearest non-tool predecessor, and the assistant must declare that tool_call_id.
+/// Any block that violates this (wrong ordering OR missing IDs) is dropped entirely.
+/// Returns the sanitized message list and a bool indicating whether anything was dropped.
+fn sanitize_messages(msgs: Vec<ChatMessage>) -> (Vec<ChatMessage>, bool) {
+    let n = msgs.len();
+    let mut keep = vec![true; n];
+
+    let mut i = 0;
+    while i < n {
+        if msgs[i].role != "assistant" {
+            // Bare tool message with no preceding assistant — orphaned.
+            if msgs[i].role == "tool" && keep[i] {
+                warn!(position = i, "Dropping orphaned tool message (no preceding assistant)");
+                keep[i] = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Only care about assistant messages that carry tool calls.
+        let tcs = match msgs[i].tool_calls.as_ref().filter(|tc| !tc.is_empty()) {
+            Some(tc) => tc,
+            None => { i += 1; continue; }
+        };
+
+        let expected: std::collections::HashSet<&str> =
+            tcs.iter().map(|tc| tc.id.as_str()).collect();
+
+        // Collect the run of tool messages immediately following this assistant.
+        let block_start = i + 1;
+        let mut j = block_start;
+        while j < n && msgs[j].role == "tool" {
+            j += 1;
+        }
+        let block_end = j; // exclusive
+
+        // Check: every consecutive tool result must match an expected ID, and
+        // every expected ID must appear exactly once in the block.
+        let consecutive_ids: std::collections::HashSet<&str> = msgs[block_start..block_end]
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+
+        if consecutive_ids != expected {
+            // Block is incomplete or has unexpected IDs → drop it.
+            // This covers: crash (missing results) and race (interleaved user message
+            // pushed the results out of the consecutive window).
+            warn!(
+                position = i,
+                expected = expected.len(),
+                found = consecutive_ids.len(),
+                "Dropping invalid tool block (crash or concurrent-branch race recovery)"
+            );
+            keep[i] = false;
+            for k in block_start..block_end {
+                keep[k] = false;
+            }
+            // Also remove any stray results for these IDs that appear later in history.
+            for k in block_end..n {
+                if msgs[k].role == "tool" {
+                    if msgs[k].tool_call_id.as_deref().is_some_and(|id| expected.contains(id)) {
+                        keep[k] = false;
+                    }
+                }
+            }
+        }
+
+        i = block_end; // jump past the block
+    }
+
+    let dropped = keep.iter().filter(|&&k| !k).count();
+    if dropped > 0 {
+        warn!(dropped, "Sanitizer removed invalid messages before LLM call");
+    }
+
+    let cleaned = msgs.into_iter()
+        .zip(keep)
+        .filter_map(|(m, k)| if k { Some(m) } else { None })
+        .collect();
+    (cleaned, dropped > 0)
 }
 
 async fn execute_tools_parallel(tools: &ToolRegistry, calls: &[ToolCallInfo], ctx: &CallContext) -> Vec<String> {

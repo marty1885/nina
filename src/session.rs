@@ -36,10 +36,11 @@ impl Session {
 
     /// Trim history at ~80% of max_messages, keeping system prompt + recent turns.
     /// Never trims mid-tool-call-sequence.
-    pub fn trim_if_needed(&mut self, max_messages: usize) {
+    /// Returns true if messages were actually trimmed.
+    pub fn trim_if_needed(&mut self, max_messages: usize) -> bool {
         let threshold = max_messages * 80 / 100;
         if self.messages.len() <= threshold {
-            return;
+            return false;
         }
 
         let system = self.messages[0].clone();
@@ -56,12 +57,121 @@ impl Session {
         }
 
         if cut_at >= self.messages.len() {
-            return;
+            return false;
         }
 
         let mut trimmed = vec![system];
         trimmed.extend_from_slice(&self.messages[cut_at..]);
         self.messages = trimmed;
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::ChatMessage;
+
+    fn sys() -> ChatMessage {
+        ChatMessage::system("system prompt")
+    }
+
+    fn user(t: &str) -> ChatMessage {
+        ChatMessage::user(t)
+    }
+
+    fn asst(t: &str) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some(t.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    fn make_session(messages: Vec<ChatMessage>) -> Session {
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let mut s = Session::new("system prompt", date);
+        s.messages = messages;
+        s
+    }
+
+    #[test]
+    fn no_trim_when_under_threshold() {
+        // threshold = 80 * 80 / 100 = 64, so 5 messages is well below
+        let msgs = vec![sys(), user("u1"), asst("a1"), user("u2"), asst("a2")];
+        let mut s = make_session(msgs.clone());
+        s.trim_if_needed(80);
+        assert_eq!(s.messages.len(), 5);
+    }
+
+    #[test]
+    fn trim_fires_above_threshold() {
+        // 81 messages > threshold of 64
+        let mut msgs = vec![sys()];
+        for i in 0..40 {
+            msgs.push(user(&format!("u{i}")));
+            msgs.push(asst(&format!("a{i}")));
+        }
+        assert_eq!(msgs.len(), 81);
+
+        let mut s = make_session(msgs);
+        s.trim_if_needed(80);
+        assert!(s.messages.len() < 81);
+    }
+
+    #[test]
+    fn trim_preserves_system_prompt() {
+        let mut msgs = vec![sys()];
+        for i in 0..40 {
+            msgs.push(user(&format!("u{i}")));
+            msgs.push(asst(&format!("a{i}")));
+        }
+        let mut s = make_session(msgs);
+        s.trim_if_needed(80);
+        assert_eq!(s.messages[0].role, "system");
+        assert_eq!(s.messages[0].content.as_deref(), Some("system prompt"));
+    }
+
+    #[test]
+    fn trim_cut_point_is_user_message() {
+        // After trim, the first non-system message must be a "user" message
+        let mut msgs = vec![sys()];
+        for i in 0..40 {
+            msgs.push(user(&format!("u{i}")));
+            msgs.push(asst(&format!("a{i}")));
+        }
+        let mut s = make_session(msgs);
+        s.trim_if_needed(80);
+        if s.messages.len() > 1 {
+            assert_eq!(s.messages[1].role, "user");
+        }
+    }
+
+    #[test]
+    fn trim_keeps_recent_messages() {
+        let mut msgs = vec![sys()];
+        for i in 0..40 {
+            msgs.push(user(&format!("u{i}")));
+            msgs.push(asst(&format!("a{i}")));
+        }
+        let mut s = make_session(msgs);
+        s.trim_if_needed(80);
+        // The last message in the original should still be present
+        let last = s.messages.last().unwrap();
+        assert_eq!(last.content.as_deref(), Some("a39"));
+    }
+
+    #[test]
+    fn refresh_system_prompt_replaces_first_message() {
+        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let new_date = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let mut s = Session::new("old prompt", date);
+        s.messages.push(user("hello"));
+        s.refresh_system_prompt("new prompt", new_date);
+        assert_eq!(s.messages[0].content.as_deref(), Some("new prompt"));
+        assert_eq!(s.messages[1].role, "user"); // conversation preserved
+        assert_eq!(s.prompt_date, new_date);
     }
 }
 
@@ -81,6 +191,8 @@ pub struct SessionManager {
     model_name: String,
     /// Tool (name, description) pairs for the Tooling section.
     tool_summaries: Vec<(String, String)>,
+    /// Agent name for default soul fallback.
+    agent_name: String,
 }
 
 impl SessionManager {
@@ -93,6 +205,7 @@ impl SessionManager {
         workspace_dir: String,
         model_name: String,
         tool_summaries: Vec<(String, String)>,
+        agent_name: String,
     ) -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -104,6 +217,7 @@ impl SessionManager {
             workspace_dir,
             model_name,
             tool_summaries,
+            agent_name,
         }
     }
 
@@ -117,6 +231,7 @@ impl SessionManager {
             &self.model_name,
             None,
             &self.tool_summaries,
+            &self.agent_name,
         ) {
             Ok(prompt) => prompt,
             Err(e) => {
@@ -203,12 +318,12 @@ impl SessionManager {
         }
 
         let mut sessions = self.sessions.write().await;
-        let prompt = self.system_prompt.clone();
-        let session = sessions
-            .entry(key.to_string())
-            .or_insert_with(|| Session::new(&prompt, Local::now().date_naive()));
-        session.messages.push(ChatMessage::user(session_text));
-        session.touch();
+        if let Some(session) = sessions.get_mut(key) {
+            session.messages.push(ChatMessage::user(session_text));
+            session.touch();
+        } else {
+            warn!(session_key = %key, "push_user_message: session missing after ensure_loaded");
+        }
     }
 
     /// Push a non-user message (assistant text, tool calls, tool results).
@@ -221,33 +336,44 @@ impl SessionManager {
             }
         }
 
+        self.ensure_loaded(key).await;
+
         let mut sessions = self.sessions.write().await;
-        let prompt = self.system_prompt.clone();
-        let session = sessions
-            .entry(key.to_string())
-            .or_insert_with(|| Session::new(&prompt, Local::now().date_naive()));
-        session.messages.push(msg);
-        session.touch();
+        if let Some(session) = sessions.get_mut(key) {
+            session.messages.push(msg);
+            session.touch();
+        } else {
+            warn!(session_key = %key, "push_message: session missing after ensure_loaded");
+        }
     }
 
-    /// Push multiple messages atomically (used for tool results).
-    pub async fn push_messages(&self, key: &str, msgs: Vec<ChatMessage>) {
-        // Persist all before acquiring the session lock.
-        for msg in &msgs {
-            if msg.role != "system" {
-                if let Err(e) = self.conv_store.save_message(key, msg) {
-                    warn!(session_key = %key, "Failed to persist message (role={}): {e}", msg.role);
-                }
-            }
+    /// Push an assistant-with-tool-calls message and all its tool results atomically.
+    ///
+    /// Keeping these in one lock acquisition prevents concurrent branches from
+    /// interleaving a user message between the assistant and its results, which
+    /// would produce "tool message has no corresponding toolcall" API errors.
+    pub async fn push_tool_turn(
+        &self,
+        key: &str,
+        assistant: ChatMessage,
+        results: Vec<ChatMessage>,
+    ) {
+        // Persist atomically — assistant + all results in one transaction so a crash
+        // mid-write can't leave orphaned tool-result rows in the DB.
+        if let Err(e) = self.conv_store.save_tool_turn(key, &assistant, &results) {
+            warn!(session_key = %key, "Failed to persist tool turn: {e}");
         }
 
+        self.ensure_loaded(key).await;
+
         let mut sessions = self.sessions.write().await;
-        let prompt = self.system_prompt.clone();
-        let session = sessions
-            .entry(key.to_string())
-            .or_insert_with(|| Session::new(&prompt, Local::now().date_naive()));
-        session.messages.extend(msgs);
-        session.touch();
+        if let Some(session) = sessions.get_mut(key) {
+            session.messages.push(assistant);
+            session.messages.extend(results);
+            session.touch();
+        } else {
+            warn!(session_key = %key, "push_tool_turn: session missing after ensure_loaded");
+        }
     }
 
     /// Clear the in-memory session and wipe DB history (called on /reset).
@@ -261,10 +387,37 @@ impl SessionManager {
         sessions.insert(key.to_string(), Session::new(&prompt, Local::now().date_naive()));
     }
 
-    pub async fn trim(&self, key: &str, max_messages: usize) {
+    /// Replace the in-memory message list for a session with a repaired copy,
+    /// and rewrite the DB so the fix survives restarts.
+    pub async fn repair_messages(&self, key: &str, repaired: Vec<ChatMessage>) {
+        // Rewrite DB first (outside the session lock — DB write is slow).
+        if let Err(e) = self.conv_store.rewrite_history(key, &repaired) {
+            warn!(session_key = %key, "Failed to rewrite history after sanitization: {e}");
+        }
+
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(key) {
-            session.trim_if_needed(max_messages);
+            session.messages = repaired;
+        }
+    }
+
+    pub async fn trim(&self, key: &str, max_messages: usize) {
+        let trimmed_messages = {
+            let mut sessions = self.sessions.write().await;
+            sessions.get_mut(key).and_then(|session| {
+                if session.trim_if_needed(max_messages) {
+                    Some(session.messages.clone())
+                } else {
+                    None
+                }
+            })
+        };
+
+        // If trim fired, rewrite DB so it stays bounded across restarts.
+        if let Some(messages) = trimmed_messages {
+            if let Err(e) = self.conv_store.rewrite_history(key, &messages) {
+                warn!(session_key = %key, "Failed to rewrite history after trim: {e}");
+            }
         }
     }
 

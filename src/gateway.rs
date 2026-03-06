@@ -1,4 +1,4 @@
-use crate::llm::{ChatMessage, DeepInfraProvider, LlmProvider, LlmResponse};
+use crate::llm::{ChatMessage, LlmProvider, LlmResponse};
 use crate::session::SessionManager;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -285,10 +285,14 @@ Reply with exactly one word: RELATED or UNRELATED"#
         let system_prompt = format!(
             r#"You are a conversation flow manager. The user is chatting with an AI assistant that processes multiple requests concurrently. Another processing thread has already sent messages to the user.
 
-Your job is to take a new outgoing message from a different thread and decide what to do:
-1. If the message is redundant with what was already sent → respond with nothing (empty response)
-2. If the message adds value but needs context → rewrite it to flow naturally after what was already sent
-3. If the message should be ignored (irrelevant, confusing, or would break conversation flow) → respond with nothing
+Your job: decide what to do with a new outgoing message from a different thread.
+
+Rules:
+- If redundant, irrelevant, or would break flow → output EXACTLY the string: SUPPRESS
+- If it adds value but needs context → output ONLY the rewritten message text
+- If it's fine as-is → output the message unchanged
+
+CRITICAL: Output ONLY the final message text or the word SUPPRESS. No reasoning, no explanation, no thinking, no preamble. Your entire response will be sent directly to the user (or used as a suppress signal).
 
 Recent conversation with the user (what they see):
 {recent_sent_messages}
@@ -303,7 +307,7 @@ New message to evaluate:
         let messages = vec![
             ChatMessage::system(system_prompt),
             ChatMessage::user(
-                "Evaluate the new message above and either rewrite it for flow or respond with nothing to suppress it.".to_string(),
+                "Output the rewritten message or SUPPRESS. Nothing else.".to_string(),
             ),
         ];
 
@@ -312,7 +316,7 @@ New message to evaluate:
         match response {
             LlmResponse::Text(text) => {
                 let trimmed = text.trim();
-                if trimmed.is_empty() {
+                if trimmed.is_empty() || trimmed == "SUPPRESS" {
                     Ok(None)
                 } else {
                     Ok(Some(trimmed.to_string()))
@@ -333,10 +337,7 @@ pub struct GatewayMap {
 }
 
 impl GatewayMap {
-    pub fn new(base_url: &str, api_key: &str, model: &str) -> Self {
-        let gateway_llm: Arc<dyn LlmProvider> = Arc::new(DeepInfraProvider::new(
-            base_url, api_key, model,
-        ));
+    pub fn new(gateway_llm: Arc<dyn LlmProvider>) -> Self {
         Self {
             orchestrators: Mutex::new(HashMap::new()),
             gateway_llm,

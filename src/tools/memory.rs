@@ -73,7 +73,7 @@ impl Tool for RememberTool {
         let category = args.category.as_deref().unwrap_or("conversation");
         let source = args.source.as_deref().unwrap_or("user");
         self.store
-            .remember(&args.content, category, source)
+            .remember(&args.content, category, source, None)
             .await
             .map_err(|e| MemoryError(format!("Failed to store memory: {e}")))?;
         Ok("Remembered.".into())
@@ -122,7 +122,7 @@ impl Tool for RecallTool {
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
         self.store
-            .recall(&args.query)
+            .recall(&args.query, None)
             .await
             .map_err(|e| MemoryError(format!("Failed to recall: {e}")))
     }
@@ -137,6 +137,10 @@ pub struct RememberDailyTool {
 impl RememberDailyTool {
     pub fn new(context_dir: PathBuf) -> Self {
         Self { context_dir }
+    }
+
+    pub fn context_dir(&self) -> &PathBuf {
+        &self.context_dir
     }
 }
 
@@ -154,7 +158,7 @@ impl Tool for RememberDailyTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "remember_daily".into(),
-            description: "Append a note to today's daily log file. Use this for session-specific context, task progress, things to follow up on, or anything relevant to today. Separate from long-term semantic memory.".into(),
+            description: "Append a note to today's daily log. This storage expires within 1-2 days — use it for context that's only relevant in the near term: task progress, session follow-ups, things to check on tomorrow.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -223,7 +227,7 @@ impl Tool for UpdateMemoryTool {
 
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
         self.store
-            .update_memory(&args.query, args.new_content)
+            .update_memory(&args.query, args.new_content, None)
             .await
             .map_err(|e| MemoryError(format!("Failed to update memory: {e}")))
     }

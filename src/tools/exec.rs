@@ -12,7 +12,13 @@ pub struct ExecArgs {
     /// matches, `test -f`, probing commands). The output is still returned but
     /// won't count as a tool error toward the burst guard.
     pub allow_error: Option<bool>,
+    /// Optional timeout in seconds. Defaults to 30s. Clamped to a maximum of
+    /// 1800s (30 minutes).
+    pub timeout_secs: Option<u64>,
 }
+
+const DEFAULT_TIMEOUT_SECS: u64 = 30;
+const MAX_TIMEOUT_SECS: u64 = 1800;
 
 #[derive(Debug)]
 pub struct ExecError(pub String);
@@ -34,7 +40,7 @@ impl Tool for ExecTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "exec".into(),
-            description: "Execute a shell command. Returns stdout followed by stderr (prefixed with \"[stderr]\"). Output is truncated (200 char/line, 80 lines, 4000 bytes max).".into(),
+            description: format!("Execute a shell command. Returns stdout followed by stderr (prefixed with \"[stderr]\"). Output is truncated (200 char/line, 80 lines, 4000 bytes max). Default timeout is {DEFAULT_TIMEOUT_SECS}s; automatically clamped to {MAX_TIMEOUT_SECS}s max."),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -45,6 +51,10 @@ impl Tool for ExecTool {
                     "allow_error": {
                         "type": "boolean",
                         "description": "Set to true when a non-zero exit code is expected (e.g. grep with no matches, test -f, probing commands). Output is still returned but the failure won't count against the error burst guard."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": format!("Timeout in seconds for the command. Defaults to {DEFAULT_TIMEOUT_SECS}. Automatically clamped to {MAX_TIMEOUT_SECS} max. Use longer timeouts for builds, package installs, or other slow operations.")
                     }
                 },
                 "required": ["command"]
@@ -55,15 +65,16 @@ impl Tool for ExecTool {
     async fn call(&self, args: Self::Args) -> Result<String, Self::Error> {
         info!(cmd = %args.command, "exec tool");
 
+        let timeout = args.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).min(MAX_TIMEOUT_SECS);
         let output = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
+            std::time::Duration::from_secs(timeout),
             tokio::process::Command::new("/bin/bash")
                 .arg("-c")
                 .arg(&args.command)
                 .output(),
         )
         .await
-        .map_err(|_| ExecError("Command timed out after 30s".into()))?
+        .map_err(|_| ExecError(format!("Command timed out after {timeout}s")))?
         .map_err(|e| ExecError(format!("Failed to execute: {e}")))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);

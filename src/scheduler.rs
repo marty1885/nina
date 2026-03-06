@@ -54,7 +54,7 @@ impl Scheduler {
             Box::pin(async move {
                 info!(task = %name, "Scheduled task firing");
                 let session_key = target.session_key();
-                let call_ctx = CallContext { target: target.clone() };
+                let call_ctx = CallContext { target: target.clone(), identity_id: None };
                 // Scheduled tasks don't participate in branch/merge — use a dummy absorb channel.
                 let (_absorb_tx, mut absorb_rx) = tokio::sync::mpsc::channel::<String>(1);
                 match agent.process_message(&session_key, &message, &message, |_| async {}, &mut absorb_rx, &call_ctx).await {
@@ -71,30 +71,6 @@ impl Scheduler {
 
         self.sched.add(job).await?;
         info!(task = %task.name, cron = %task.cron, "Scheduled task registered");
-        Ok(())
-    }
-
-    /// Add a raw cron job with a custom async closure.
-    pub async fn add_raw_job<F, Fut>(
-        &mut self,
-        cron: &str,
-        name: &str,
-        task_fn: F,
-    ) -> Result<()>
-    where
-        F: Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync + 'static,
-    {
-        let job_name = name.to_string();
-        let job = Job::new_async(cron, move |_uuid, _lock| {
-            let name = job_name.clone();
-            let fut = task_fn();
-            Box::pin(async move {
-                info!(task = %name, "Raw scheduled job firing");
-                fut.await;
-            })
-        })?;
-        self.sched.add(job).await?;
-        info!(task = %name, cron = %cron, "Raw scheduled job registered");
         Ok(())
     }
 

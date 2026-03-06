@@ -165,7 +165,16 @@ impl Channel for TelegramBot {
         let resp = match resp {
             Ok(r) => r,
             Err(e) => {
-                error!("Telegram poll error: {e}");
+                // Redact the URL (which contains the bot token) from the error string.
+                let msg = e.to_string();
+                let safe = if let Some(idx) = msg.find("/bot") {
+                    let after = &msg[idx + 4..]; // skip "/bot"
+                    let end = after.find('/').map(|i| idx + 4 + i).unwrap_or(msg.len());
+                    format!("{}[token]{}", &msg[..idx + 4], &msg[end..])
+                } else {
+                    msg
+                };
+                error!("Telegram poll error: {safe}");
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                 return vec![];
             }

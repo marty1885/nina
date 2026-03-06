@@ -20,6 +20,8 @@ impl ChannelTarget {
 #[derive(Clone, Debug)]
 pub struct CallContext {
     pub target: ChannelTarget,
+    /// Identity of the user this call is on behalf of. None for system-initiated calls.
+    pub identity_id: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -45,6 +47,48 @@ pub trait Channel: Send + Sync {
     async fn poll_updates(&self) -> Vec<IncomingMessage>;
     async fn send_text(&self, target: &ChannelTarget, text: &str);
     async fn send_voice(&self, target: &ChannelTarget, audio: Vec<u8>);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_key_format() {
+        let target = ChannelTarget {
+            channel_id: "telegram".into(),
+            chat_id: 12345,
+        };
+        assert_eq!(target.session_key(), "telegram:12345");
+    }
+
+    #[test]
+    fn session_key_negative_chat_id() {
+        // Group chats have negative IDs in Telegram
+        let target = ChannelTarget {
+            channel_id: "telegram".into(),
+            chat_id: -100123456,
+        };
+        assert_eq!(target.session_key(), "telegram:-100123456");
+    }
+
+    #[test]
+    fn session_key_zero_chat_id() {
+        let target = ChannelTarget {
+            channel_id: "matrix".into(),
+            chat_id: 0,
+        };
+        assert_eq!(target.session_key(), "matrix:0");
+    }
+
+    #[test]
+    fn channel_target_equality() {
+        let a = ChannelTarget { channel_id: "telegram".into(), chat_id: 1 };
+        let b = ChannelTarget { channel_id: "telegram".into(), chat_id: 1 };
+        let c = ChannelTarget { channel_id: "telegram".into(), chat_id: 2 };
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
 }
 
 pub struct ChannelRouter {

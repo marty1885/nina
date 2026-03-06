@@ -9,9 +9,12 @@ mod memory;
 mod pairing;
 mod reminders;
 mod scheduler;
+mod self_awareness;
 mod session;
+mod setup;
 mod skills;
 mod telegram;
+mod timer;
 mod tools;
 mod tts;
 
@@ -21,7 +24,6 @@ use clap::{Parser, Subcommand};
 use config::Config;
 use conversation::ConversationStore;
 use gateway::GatewayMap;
-use llm::DeepInfraProvider;
 use pairing::PairingStore;
 use reminders::{ReminderStore, spawn_reminder_task};
 use session::SessionManager;
@@ -36,7 +38,7 @@ use tracing::{error, info};
 // ---- CLI ----------------------------------------------------------------
 
 #[derive(Parser)]
-#[command(name = "nina", about = "Nina AI assistant")]
+#[command(name = "nina", about = "AI assistant")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -49,6 +51,8 @@ enum Command {
         #[command(subcommand)]
         action: PairAction,
     },
+    /// Run the interactive setup wizard
+    Setup,
 }
 
 #[derive(Subcommand)]
@@ -104,6 +108,11 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Pair { action }) => run_pair_command(action, &db_path),
+        Some(Command::Setup) => {
+            std::fs::create_dir_all(&config.home_dir)?;
+            std::fs::create_dir_all(config.context_dir())?;
+            setup::run_setup(&config).await
+        }
         None => run_server(config).await,
     }
 }
@@ -157,6 +166,34 @@ fn run_pair_command(action: PairAction, db_path: &Path) -> anyhow::Result<()> {
     }
 }
 
+// ---- Helpers -------------------------------------------------------------
+
+fn build_weighted(providers: &[(config::ResolvedProvider, u32)]) -> std::sync::Arc<dyn llm::LlmProvider> {
+    let pool = providers
+        .iter()
+        .map(|(p, w)| {
+            let provider: std::sync::Arc<dyn llm::LlmProvider> =
+                std::sync::Arc::new(llm::OpenAiProvider::new(&p.base_url, &p.api_key, &p.model));
+            (provider, *w)
+        })
+        .collect();
+    std::sync::Arc::new(llm::WeightedProvider::new(pool))
+}
+
+/// Build the LLM handle for a section. If a fallback tier is provided, wraps both
+/// in a `TieredProvider` (primary exhausted → fallback). Otherwise returns the
+/// primary `WeightedProvider` directly.
+fn build_llm(
+    primary: &[(config::ResolvedProvider, u32)],
+    fallback: &[(config::ResolvedProvider, u32)],
+) -> std::sync::Arc<dyn llm::LlmProvider> {
+    let primary_tier = build_weighted(primary);
+    if fallback.is_empty() {
+        return primary_tier;
+    }
+    std::sync::Arc::new(llm::TieredProvider::new(vec![primary_tier, build_weighted(fallback)]))
+}
+
 // ---- Server --------------------------------------------------------------
 
 async fn run_server(config: Config) -> anyhow::Result<()> {
@@ -174,10 +211,22 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     std::fs::create_dir_all(&config.workspace_dir)?;
     std::env::set_current_dir(&config.workspace_dir)?;
 
+    // Auto-bootstrap if no soul.md exists
+    if !soul_file.exists() {
+        eprintln!(
+            "No soul.md found at {} — bootstrapping...",
+            soul_file.display()
+        );
+        setup::run_setup(&config).await?;
+    }
+
+    let agent_name = config.agent_name();
+
     info!(
         home = %config.home_dir.display(),
         workspace = %config.workspace_dir.display(),
-        "Nina directories initialized"
+        name = %agent_name,
+        "Directories initialized"
     );
 
     let data_dir_str = data_dir.to_string_lossy().to_string();
@@ -228,9 +277,9 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         &config.tts_model,
     ));
     skill_registry.register(Box::new(skills::tts::TtsSkill::new(tts_client, router.clone())));
-    skill_registry.register(Box::new(skills::sessions_send::SendToSessionSkill::new(router.clone())));
+    skill_registry.register(Box::new(skills::sessions_send::SendToSessionSkill::new(router.clone(), sessions_cell.clone())));
 
-    skill_registry.register(Box::new(skills::current_time::CurrentTimeSkill::new()));
+    skill_registry.register(Box::new(skills::current_time::CurrentTimeSkill::new(pairing_store.clone())));
     skill_registry.register(Box::new(skills::lua::LuaSkill::new()));
     skill_registry.register(Box::new(skills::files::FilesSkill::new(
         vec![
@@ -269,7 +318,12 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     let skill_additions = tool_registry.system_prompt_additions();
 
     let workspace_dir_str = config.workspace_dir.to_string_lossy().to_string();
-    let model_name = config.llm_model.clone();
+    let model_name = config
+        .agent_providers
+        .iter()
+        .map(|(p, _)| p.model.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let tool_summaries = tool_registry.tool_summaries().await;
 
     let soul = identity::build_system_prompt(
@@ -280,17 +334,14 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         &model_name,
         None,
         &tool_summaries,
+        &agent_name,
     )?;
 
     if config.debug {
         info!("[debug] System prompt ({} chars):\n{}", soul.len(), soul);
     }
 
-    let llm: Arc<dyn llm::LlmProvider> = Arc::new(DeepInfraProvider::new(
-        &config.llm_base_url,
-        &config.deepinfra_api_key,
-        &config.llm_model,
-    ));
+    let llm = build_llm(&config.agent_providers, &config.agent_fallback);
 
     let tool_registry = Arc::new(tool_registry);
     let sessions = Arc::new(SessionManager::new(
@@ -302,6 +353,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         workspace_dir_str,
         model_name,
         tool_summaries,
+        agent_name.clone(),
     ));
 
     if config.debug {
@@ -339,18 +391,42 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
     sched.start().await?;
     info!("Scheduler started");
 
+    // Self-awareness pass — persistent random interval, crash-recovery aware.
+    {
+        let timers = timer::open(&db_path)?;
+        let awareness = Arc::new(self_awareness::SelfAwareness::new(
+            agent.clone(),
+            pairing_store.clone(),
+        ));
+        info!("Starting self-awareness loop (4–6h persistent random interval)");
+        let sa_min = config.self_awareness_interval_hours.saturating_sub(1).max(1);
+        let sa_max = config.self_awareness_interval_hours + 1;
+        let sa_trigger = Arc::new(tokio::sync::Notify::new());
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let trigger = sa_trigger.clone();
+            tokio::spawn(async move {
+                let mut sigusr1 = signal(SignalKind::user_defined1())
+                    .expect("failed to register SIGUSR1 handler");
+                loop {
+                    sigusr1.recv().await;
+                    info!("SIGUSR1 received — triggering self-awareness pass");
+                    trigger.notify_one();
+                }
+            });
+        }
+        self_awareness::spawn(awareness, sa_min, sa_max, timers, sa_trigger);
+    }
+
     // Gateway map for branch & merge orchestration
-    let gateway_map = Arc::new(GatewayMap::new(
-        &config.llm_base_url,
-        &config.deepinfra_api_key,
-        &config.gateway_llm_model,
-    ));
+    let gateway_map = Arc::new(GatewayMap::new(build_llm(&config.gateway_providers, &config.gateway_fallback)));
 
     // Track which message is actively being processed per session.
     let active_processing: Arc<RwLock<HashMap<String, ActiveProcessing>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    info!("Nina is online — polling for updates...");
+    info!("{agent_name} is online — polling for updates...");
 
     let telegram_bot_token = config.telegram_bot_token.clone();
 
@@ -399,7 +475,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
                     );
 
                     // --- Pairing gate ---
-                    let (access_level_opt, relation_opt) = match pairing_store
+                    let (identity_id, access_level_opt, relation_opt) = match pairing_store
                         .find_identity_full(&incoming.source.channel_id, &incoming.sender_id)
                     {
                         Err(e) => {
@@ -410,7 +486,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
                             handle_unpaired_sender(&pairing_store, &router, &incoming).await;
                             continue;
                         }
-                        Ok(Some((_identity_id, access_level_opt, relation_opt))) => {
+                        Ok(Some((identity_id, access_level_opt, relation_opt))) => {
                             // Notify on first post-approval message
                             match pairing_store.pop_pending_notification(
                                 &incoming.source.channel_id,
@@ -422,7 +498,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
                                 Ok(None) => {}
                                 Err(e) => error!("Notification check error: {e}"),
                             }
-                            (access_level_opt, relation_opt)
+                            (identity_id, access_level_opt, relation_opt)
                         }
                     };
 
@@ -470,7 +546,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
                                     .await
                                     .send_text(
                                         &incoming.source,
-                                        "Hey, I'm Nina 🧊 — your AI assistant. Just talk to me.",
+                                        &format!("Hey, I'm {agent_name} — your AI assistant. Just talk to me."),
                                     )
                                     .await;
                             }
@@ -558,6 +634,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
 
                     let call_ctx = CallContext {
                         target: incoming.source.clone(),
+                        identity_id: Some(identity_id),
                     };
 
                     let agent = agent.clone();
@@ -597,7 +674,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
                             let orchestrator = orchestrator_cb.clone();
                             let user_msg = user_text.clone();
                             async move {
-                                if t.trim() == "SILENT" {
+                                if t.trim() == "SILENT" || is_empty_response(&t) {
                                     return;
                                 }
                                 match orchestrator
@@ -633,7 +710,7 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
                         };
 
                         if let Some(resp) = response {
-                            if !resp.is_empty() && resp.trim() != "SILENT" {
+                            if !resp.is_empty() && resp.trim() != "SILENT" && !is_empty_response(&resp) {
                                 match orchestrator
                                     .send_or_merge(branch_id, &resp, &text)
                                     .await
@@ -657,8 +734,20 @@ async fn run_server(config: Config) -> anyhow::Result<()> {
         }
     }
 
-    info!("Nina shutting down gracefully");
+    info!("{agent_name} shutting down gracefully");
     Ok(())
+}
+
+/// Returns true if the response is a vacuous meta-response that shouldn't be sent.
+/// Catches things like "(Empty response)", "(No response)", etc. that models sometimes emit.
+fn is_empty_response(text: &str) -> bool {
+    let t = text.trim().to_lowercase();
+    // Parenthesized meta-responses
+    if t.starts_with('(') && t.ends_with(')') && t.len() < 40 {
+        let inner = &t[1..t.len() - 1];
+        return inner.contains("empty") || inner.contains("no response") || inner.contains("nothing");
+    }
+    false
 }
 
 /// Truncate text from both ends, keeping start and end with "…" in the middle.
@@ -672,6 +761,45 @@ fn truncate_both_ends(text: &str, max_len: usize) -> String {
     let end: String = text.chars().rev().take(side).collect();
     let end: String = end.chars().rev().collect();
     format!("{}…{}", start.trim_end(), end.trim_start())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_both_ends_short_string() {
+        assert_eq!(truncate_both_ends("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_both_ends_exact_length() {
+        let s = "a".repeat(10);
+        assert_eq!(truncate_both_ends(&s, 10), s);
+    }
+
+    #[test]
+    fn truncate_both_ends_long_string_has_ellipsis() {
+        let result = truncate_both_ends("hello world foo bar baz", 10);
+        assert!(result.contains('…'));
+    }
+
+    #[test]
+    fn truncate_both_ends_preserves_start_and_end() {
+        let result = truncate_both_ends("abcdefghijklmnopqrstuvwxyz", 10);
+        assert!(result.starts_with("abcde"));
+        assert!(result.ends_with("vwxyz"));
+    }
+
+    #[test]
+    fn truncate_both_ends_trims_surrounding_whitespace() {
+        assert_eq!(truncate_both_ends("  hello  ", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_both_ends_empty() {
+        assert_eq!(truncate_both_ends("", 10), "");
+    }
 }
 
 /// Handle a message from an unpaired sender: issue a pairing code or remind them it's pending.
