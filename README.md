@@ -87,4 +87,4 @@ Everything is stored in a single SQLite database at `$NINA_HOME/data/nina.db` â€
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE](LICENSE.txt) for details.
